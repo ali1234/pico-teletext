@@ -1,0 +1,125 @@
+; This file is part of pico-teletext (https://github.com/ali1234/pico-teletext).
+; Copyright (c) 2024 Alistair Buxton.
+;
+; This program is free software: you can redistribute it and/or modify
+; it under the terms of the GNU General Public License as published by
+; the Free Software Foundation, version 3.
+;
+; This program is distributed in the hope that it will be useful, but
+; WITHOUT ANY WARRANTY; without even the implied warranty of
+; MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
+; General Public License for more details.
+;
+; You should have received a copy of the GNU General Public License
+; along with this program. If not, see <http://www.gnu.org/licenses/>.
+
+
+.program sync
+.side_set 1           ; csync
+.wrap_target
+    pull                side 1
+    out y, 9            side 1
+    out isr, 23         side 1
+repeat:
+    mov osr, isr        side 1
+    out x, 6            side 0   [5]
+delay1:
+    jmp x--, delay1     side 0   [2]
+    out pins, 2         side 1
+    out x, 9            side 1
+delay2:
+    jmp x--, delay2     side 1
+    jmp y--, rpt_delay  side 1
+.wrap
+rpt_delay:
+    jmp repeat          side 1   [2]
+
+% c-sdk {
+
+void sync_program_init(PIO pio, uint sm, uint offset, uint pin) {
+    // uses 3 consecutive pins
+    pio_sm_config c = sync_program_get_default_config(offset);
+    pio_sm_set_consecutive_pindirs(pio, sm, pin, 3, true);
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_TX);
+    sm_config_set_sideset_pins(&c, pin);
+    sm_config_set_out_pins(&c, pin+1, 2);
+    for (int i=0; i<3; i++)
+        pio_gpio_init(pio, pin+i);
+    sm_config_set_clkdiv_int_frac(&c, 37, 0);
+    pio_sm_init(pio, sm, offset, &c);
+}
+
+%}
+
+
+.program counter
+.wrap_target
+    wait 0 pin 1     ; wait for vsync pin to go low
+                     ; note: this happens *after* the csync pulse
+                     ; but field is valid at this time
+    irq set 0        ; send vsync interrupt to CPU code
+    set x, 8
+    jmp pin, sync    ; if pin, odd field, count 9 syncs
+    jmp x--, sync    ; otherwise dec x, count 8 syncs
+sync:                ; (remember: loop ends on overflow, not 0)
+    wait 0 pin 0
+    wait 1 pin 0
+    jmp x--, sync
+    mov x, osr
+video:
+    wait 0 pin 0   [15]  ; wait for a hsync pulse + 10 usec
+    irq set 5            ; trigger pixel drawing program
+    jmp x--, video
+.wrap
+
+% c-sdk {
+
+void counter_program_init(PIO pio, uint sm, uint offset, uint pin) {
+    // uses the same three pins as sync
+    // waits on 0 and 1. jmps on 2 (odd/even select)
+    pio_sm_config c = counter_program_get_default_config(offset);
+    sm_config_set_in_pins(&c, pin);
+    sm_config_set_jmp_pin(&c, pin+2);
+    sm_config_set_clkdiv_int_frac(&c, 111, 0);
+    pio_sm_init(pio, sm, offset, &c);
+    pio_sm_set_consecutive_pindirs(pio, sm, 6, 4, true);
+    pio_sm_put(pio, sm, 304);
+    pio_sm_exec(pio, sm, pio_encode_pull(false, true));
+}
+
+%}
+
+
+.program draw
+.wrap_target
+    mov y, isr
+    wait 1 irq 5
+loop:
+    out pins, 2
+    jmp y--, loop
+    set pins, 0
+.wrap
+
+% c-sdk {
+
+void draw_program_init(PIO pio, uint sm, uint offset, uint pin) {
+    //output pixel data on 2 pins
+    pio_sm_config c = draw_program_get_default_config(offset);
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_TX);
+    sm_config_set_out_shift(&c, true, true, 32);
+    sm_config_set_out_pins(&c, pin, 2);
+    sm_config_set_set_pins(&c, pin, 2);
+    sm_config_set_clkdiv_int_frac(&c, 6, 0);
+    for (int i=0; i<2; i++)
+        pio_gpio_init(pio, pin+i);
+    pio_sm_init(pio, sm, offset, &c);
+    pio_sm_set_consecutive_pindirs(pio, sm, pin, 2, true);
+    pio_sm_put(pio, sm, 720-1);
+    pio_sm_exec(pio, sm, pio_encode_pull(false, true));
+    pio_sm_exec(pio, sm, pio_encode_out(pio_isr, 32));
+    pio_sm_put(pio, sm, 0);
+    pio_sm_exec(pio, sm, pio_encode_pull(false, true));
+    pio_sm_exec(pio, sm, pio_encode_out(pio_x, 32));
+}
+
+%}
